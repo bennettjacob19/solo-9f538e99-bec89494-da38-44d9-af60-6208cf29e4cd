@@ -8,8 +8,9 @@ Covers:
   3. whole-version rejection: dangling / cycle / external target / conflicts
   4. publish v2: new queries use the new version
   5. consistency: answers during concurrent publishes never mix versions
-  6. write failure: old version keeps serving, DB untouched, recovery works
-  7. restart: committed version is reloaded, no partial data
+  6. negative answers: empty non-terminals, apex SOA in Authority, 60s caching
+  7. write failure: old version keeps serving, DB untouched, recovery works
+  8. restart: committed version is reloaded, no partial data
 
 Run with the project venv python:  /tmp/testvenv/bin/python tests/e2e_test.py
 """
@@ -56,6 +57,42 @@ def answers_of(resp):
     return sorted(
         (str(rr.rname), dnslib.QTYPE[rr.rtype], str(rr.rdata)) for rr in resp.rr
     )
+
+
+def auth_of(resp):
+    return sorted(
+        (str(rr.rname), dnslib.QTYPE[rr.rtype], str(rr.rdata)) for rr in resp.auth
+    )
+
+
+def soa_times(rr):
+    """SOA (serial, refresh, retry, expire, minimum) from an RR."""
+    return tuple(rr.rdata.times)
+
+
+def check_negative(name, resp, want_rcode, want_serial):
+    """NXDOMAIN or NODATA: rcode, aa, empty-or-chain Answer, apex SOA in
+    Authority with TTL and MINIMUM both 60 and the committed version serial."""
+    rcode = dnslib.RCODE[resp.header.rcode]
+    auth = auth_of(resp)
+    ok_auth = (
+        len(auth) == 1
+        and auth[0][0] == "svc.test."
+        and auth[0][1] == "SOA"
+    )
+    times = soa_times(resp.auth[0]) if ok_auth else ()
+    ttl = resp.auth[0].ttl if ok_auth else None
+    check(
+        name,
+        rcode == want_rcode
+        and resp.header.aa == 1
+        and ok_auth
+        and ttl == 60
+        and times[:1] == (want_serial & 0xFFFFFFFF,)
+        and times[4] == 60,
+        f"rcode={rcode} aa={resp.header.aa} auth={auth} ttl={ttl} times={times}",
+    )
+    return auth, ttl, times
 
 
 def publish(text, note=""):
@@ -148,6 +185,20 @@ def test_validation():
     check("unit: valid zone parses", set(ok) == {"web.svc.test.", "app.svc.test."})
 
 
+def test_serial_low_32_bits():
+    from app.zone import Snapshot, resolve
+    snap = Snapshot((1 << 32) + 9, "t", {})
+    check("unit: SOA serial is version id mod 2**32",
+          snap.soa_serial == 9 and snap.soa().times[0] == 9,
+          str(snap.soa().times))
+    snap = Snapshot(12, "t", {})  # empty version: apex and SOA still exist
+    check("unit: empty snapshot still knows the apex",
+          snap.names == frozenset({"svc.test."}))
+    rcode, answers, negative = resolve(snap, "svc.test.", "SOA")
+    check("unit: empty version still answers apex SOA",
+          rcode == "NOERROR" and len(answers) == 1 and not negative, str(answers))
+
+
 # ------------------------------------------------------------------ e2e flow
 def main():
     tmp = tempfile.mkdtemp(prefix="zonedns-e2e-")
@@ -156,6 +207,7 @@ def main():
 
     test_store_atomicity(tmp)
     test_validation()
+    test_serial_low_32_bits()
 
     proc = start_app(db)
     try:
@@ -166,12 +218,13 @@ def main():
         check("e2e: empty DB -> SERVFAIL", dnslib.RCODE[resp.header.rcode] == "SERVFAIL")
 
         # 2. publish v1
-        v1 = "web A 10.0.0.10 60\nweb A 10.0.0.11 60\napi CNAME web\napp CNAME api\ndb A 10.0.1.5 120\n"
+        v1 = ("web A 10.0.0.10 60\nweb A 10.0.0.11 60\napi CNAME web\napp CNAME api\n"
+              "db A 10.0.1.5 120\napi.dev.svc.test. A 10.0.2.7 60\n")
         r = publish(v1, note="v1")
         check("e2e: publish v1 -> 303", r.status_code == 303, f"got {r.status_code}: {r.text[:200]}")
         cur = httpx.get(WEB + "/api/current", timeout=5).json()
-        check("e2e: current is v1 with 5 records",
-              cur["version"] == 1 and len(cur["records"]) == 5, str(cur)[:200])
+        check("e2e: current is v1 with 6 records",
+              cur["version"] == 1 and len(cur["records"]) == 6, str(cur)[:200])
 
         # 3. real DNS answers from v1
         resp = dns_query("app.svc.test.", "A")
@@ -194,10 +247,55 @@ def main():
         resp = dns_query("db.svc.test.", "CNAME")
         check("e2e: CNAME qtype on A-only name -> NODATA",
               dnslib.RCODE[resp.header.rcode] == "NOERROR" and not resp.rr)
+        check_negative("e2e: NODATA carries apex SOA (v1 serial)", resp, "NOERROR", 1)
 
         resp = dns_query("nope.svc.test.", "A")
         check("e2e: unknown name -> NXDOMAIN",
               dnslib.RCODE[resp.header.rcode] == "NXDOMAIN")
+        check_negative("e2e: NXDOMAIN carries apex SOA (v1 serial)", resp, "NXDOMAIN", 1)
+
+        # empty non-terminal: dev.svc.test. has no records of its own but
+        # api.dev.svc.test. exists, so the branch must not look non-existent
+        resp = dns_query("dev.svc.test.", "A")
+        check("e2e: empty non-terminal -> NOERROR, no answer",
+              dnslib.RCODE[resp.header.rcode] == "NOERROR" and not resp.rr,
+              str(answers_of(resp)))
+        check_negative("e2e: empty non-terminal -> NODATA with apex SOA",
+                       resp, "NOERROR", 1)
+        resp = dns_query("api.dev.svc.test.", "A")
+        check("e2e: record below empty non-terminal answers",
+              answers_of(resp) == [("api.dev.svc.test.", "A", "10.0.2.7")],
+              str(answers_of(resp)))
+        resp = dns_query("gone.dev.svc.test.", "A")
+        check_negative("e2e: unknown name below existing branch -> NXDOMAIN",
+                       resp, "NXDOMAIN", 1)
+
+        # name exists but lacks the asked type (AAAA unsupported by the zone)
+        for qname, qtype in [("web.svc.test.", "AAAA"), ("dev.svc.test.", "AAAA"),
+                             ("api.dev.svc.test.", "AAAA")]:
+            resp = dns_query(qname, qtype)
+            check_negative(f"e2e: {qname} {qtype} -> NODATA with apex SOA",
+                           resp, "NOERROR", 1)
+            check(f"e2e: {qname} {qtype} has empty Answer", not resp.rr,
+                  str(answers_of(resp)))
+
+        # CNAME with no data at the target: alias chain is kept, still NODATA
+        resp = dns_query("app.svc.test.", "AAAA")
+        chain = [("api.svc.test.", "CNAME", "web.svc.test."),
+                 ("app.svc.test.", "CNAME", "api.svc.test.")]
+        check("e2e: CNAME chain kept when target lacks the type",
+              answers_of(resp) == sorted(chain), str(answers_of(resp)))
+        check_negative("e2e: CNAME NODATA carries apex SOA", resp, "NOERROR", 1)
+
+        resp = dns_query("svc.test.", "SOA")
+        check("e2e: direct apex SOA query answers the SOA",
+              dnslib.RCODE[resp.header.rcode] == "NOERROR"
+              and answers_of(resp) == [("svc.test.", "SOA", str(resp.rr[0].rdata))],
+              str(answers_of(resp)))
+        check("e2e: apex SOA serial is the low 32 bits of the version id",
+              soa_times(resp.rr[0])[0] == 1 & 0xFFFFFFFF and resp.rr[0].ttl == 60,
+              str(soa_times(resp.rr[0])))
+        check("e2e: apex SOA has no Authority section", not resp.auth)
 
         resp = dns_query("other.com.", "A")
         check("e2e: out-of-zone -> REFUSED",
@@ -206,10 +304,25 @@ def main():
         resp = dns_query("svc.test.", "A")
         check("e2e: zone apex -> NOERROR/NODATA",
               dnslib.RCODE[resp.header.rcode] == "NOERROR" and not resp.rr)
+        check_negative("e2e: apex NODATA carries apex SOA", resp, "NOERROR", 1)
 
         r = httpx.get(WEB + "/query", params={"name": "app", "qtype": "A"}, timeout=5)
         check("e2e: web query page issues real query",
-              r.status_code == 200 and "10.0.0.10" in r.text and "NOERROR" in r.text)
+              r.status_code == 200 and "10.0.0.10" in r.text and "NOERROR" in r.text
+              and "ANSWER SECTION" in r.text and "AUTHORITY SECTION" in r.text)
+        r = httpx.get(WEB + "/query", params={"name": "dev.svc.test.", "qtype": "A"},
+                      timeout=5)
+        check("e2e: web query page shows negative SOA in Authority",
+              r.status_code == 200 and "NOERROR" in r.text and "IN SOA" in r.text,
+              r.text[-400:])
+        r = httpx.get(WEB + "/query", params={"name": "svc.test.", "qtype": "SOA"},
+                      timeout=5)
+        check("e2e: web query page supports SOA",
+              r.status_code == 200 and "IN SOA" in r.text and "3600" in r.text,
+              r.text[-400:])
+        r = httpx.get(WEB + "/query", params={"name": "web", "qtype": "AAAA"}, timeout=5)
+        check("e2e: web query page supports AAAA",
+              r.status_code == 200 and "rcode: NOERROR" in r.text, r.text[-400:])
 
         # 4. invalid versions rejected wholesale; v1 keeps serving
         bad_zones = {
@@ -240,6 +353,34 @@ def main():
         resp = dns_query("web.svc.test.", "A")
         check("e2e: names dropped in v2 -> NXDOMAIN",
               dnslib.RCODE[resp.header.rcode] == "NXDOMAIN")
+        check_negative("e2e: NXDOMAIN SOA serial follows the new version",
+                       resp, "NXDOMAIN", 2)
+        resp = dns_query("svc.test.", "SOA")
+        check("e2e: apex SOA serial moves with the version",
+              soa_times(resp.rr[0])[0] == 2, str(soa_times(resp.rr[0])))
+        resp = dns_query("dev.svc.test.", "A")
+        check("e2e: empty non-terminal is gone in v2 -> NXDOMAIN",
+              dnslib.RCODE[resp.header.rcode] == "NXDOMAIN")
+        check_negative("e2e: v2 NXDOMAIN carries v2 SOA", resp, "NXDOMAIN", 2)
+
+        # 5b. version switch: the name verdict and the SOA explaining it must
+        # come from the same committed snapshot
+        v3 = ("dev.svc.test. A 10.0.3.1 60\napi.keep.svc.test. A 10.0.3.2 60\n"
+              "app CNAME dev\n")
+        r = publish(v3, note="v3")
+        check("e2e: publish v3 -> 303", r.status_code == 303)
+        v3_id = httpx.get(WEB + "/api/current", timeout=5).json()["version"]
+        resp = dns_query("dev.svc.test.", "A")
+        check("e2e: v3 empty non-terminal dev now answers",
+              answers_of(resp) == [("dev.svc.test.", "A", "10.0.3.1")],
+              str(answers_of(resp)))
+        check_negative("e2e: v3 branch keep -> NODATA, v3 SOA",
+                       dns_query("keep.svc.test.", "A"), "NOERROR", v3_id)
+        check_negative("e2e: v3 unknown below existing branch -> NXDOMAIN, v3 SOA",
+                       dns_query("gone.keep.svc.test.", "A"), "NXDOMAIN", v3_id)
+        check("e2e: v3 answers use the new snapshot",
+              answers_of(dns_query("api.keep.svc.test.", "A"))
+              == [("api.keep.svc.test.", "A", "10.0.3.2")])
 
         # 6. consistency: hammer queries while flipping between two versions
         zone_a = "app CNAME web1\nweb1 A 10.0.0.1 30\n"
@@ -256,8 +397,9 @@ def main():
                     cn = [str(rr.rdata) for rr in r2.rr if dnslib.QTYPE[rr.rtype] == "CNAME"]
                     ip = [str(rr.rdata) for rr in r2.rr if dnslib.QTYPE[rr.rtype] == "A"]
                     samples[0] += 1
+                    # dev.svc.test./10.0.3.1 also comes from v3, same chain shape
                     if rc != "NOERROR" or len(cn) != 1 or len(ip) != 1 \
-                            or (cn[0], ip[0]) not in consistent:
+                            or (cn[0], ip[0]) not in consistent | {("dev.svc.test.", "10.0.3.1")}:
                         errors.append((rc, cn, ip))
                 except Exception as exc:  # noqa: BLE001
                     errors.append(("EXC", repr(exc)))
@@ -309,6 +451,7 @@ def main():
         # 8. restart: committed version is reloaded; nothing partial appears
         last = httpx.get(WEB + "/api/current", timeout=5).json()
         n_versions = len(httpx.get(WEB + "/api/versions", timeout=5).json())
+        last_ip = [r["value"] for r in last["records"] if r["type"] == "A"][0]
     finally:
         stop_app(proc)
 
@@ -319,7 +462,13 @@ def main():
               cur["version"] == last["version"], f"{cur['version']} != {last['version']}")
         resp = dns_query("app.svc.test.", "A")
         ip = [str(rr.rdata) for rr in resp.rr if dnslib.QTYPE[rr.rtype] == "A"]
-        check("e2e: restart serves reloaded version", ip == ["10.0.0.2"], str(ip))
+        check("e2e: restart serves reloaded version", ip == [last_ip], str(ip))
+        check_negative("e2e: restart reloads the version's SOA serial",
+                       dns_query("nope.svc.test.", "A"), "NXDOMAIN", last["version"])
+        soa = dns_query("svc.test.", "SOA")
+        check("e2e: restart serves apex SOA from the committed version",
+              soa_times(soa.rr[0])[0] == last["version"] & 0xFFFFFFFF,
+              str(soa_times(soa.rr[0])))
         check("e2e: restart leaves no partial versions",
               len(httpx.get(WEB + "/api/versions", timeout=5).json()) == n_versions)
         r = httpx.get(WEB + "/", timeout=5)

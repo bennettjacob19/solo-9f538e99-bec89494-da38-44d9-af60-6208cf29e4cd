@@ -5,9 +5,22 @@ import ipaddress
 import re
 import threading
 
+from dnslib import SOA
+
 ZONE = "svc.test."
 DEFAULT_TTL = 60
 MAX_TTL = 2_147_483_647
+
+# Zone apex SOA. It is not part of the operator-supplied zone text: it is
+# synthesized from the committed version, so its serial always identifies the
+# same version that supplied the name-existence decisions in a response.
+SOA_MNAME = "ns." + ZONE
+SOA_RNAME = "hostmaster." + ZONE
+SOA_REFRESH = 3600
+SOA_RETRY = 600
+SOA_EXPIRE = 604800
+SOA_SERIAL_MASK = 0xFFFFFFFF  # serial is the low 32 bits of the version id
+NEGATIVE_TTL = 60  # SOA TTL and MINIMUM: both negative responses cache 60s
 
 _LABEL_RE = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$")
 
@@ -175,9 +188,14 @@ def flatten_records(records):
 class Snapshot:
     """Immutable view of one published version. A query resolves its whole
     alias chain against the single Snapshot instance captured at query start,
-    so the chain and the final A address always come from the same version."""
+    so the chain and the final A address always come from the same version.
 
-    __slots__ = ("version_id", "created_at", "records")
+    Both the set of existing names (including empty non-terminals) and the
+    apex SOA are computed once, before the snapshot is published to queries.
+    That keeps answer decisions and the SOA that accompanies them tied to the
+    same committed version, with no per-query zone scan."""
+
+    __slots__ = ("version_id", "created_at", "records", "names", "soa_serial")
 
     def __init__(self, version_id, created_at, records):
         self.version_id = version_id
@@ -187,6 +205,17 @@ class Snapshot:
             name: {"A": tuple(rec["A"]), "CNAME": rec["CNAME"], "ttl": rec["ttl"]}
             for name, rec in records.items()
         }
+        self.soa_serial = version_id & SOA_SERIAL_MASK
+        # every name between a record and the apex exists as an empty
+        # non-terminal: publishing api.dev.svc.test. makes dev.svc.test. exist
+        names = {ZONE}
+        for name in self.records:
+            names.add(name)
+            parent = name
+            while parent != ZONE:
+                parent = parent.split(".", 1)[1]
+                names.add(parent)
+        self.names = frozenset(names)
 
     def zone_text(self):
         lines = []
@@ -197,6 +226,14 @@ class Snapshot:
             if rec["CNAME"]:
                 lines.append(f"{name} CNAME {rec['CNAME']} {rec['ttl']}")
         return "\n".join(lines)
+
+    def soa(self):
+        """Apex SOA rdata, derived from this version's serial."""
+        return SOA(
+            SOA_MNAME,
+            SOA_RNAME,
+            times=(self.soa_serial, SOA_REFRESH, SOA_RETRY, SOA_EXPIRE, NEGATIVE_TTL),
+        )
 
 
 def snapshot_from_rows(version_id, created_at, rows):
@@ -234,12 +271,21 @@ class SnapshotHolder:
 def resolve(snapshot, qname, qtype):
     """Resolve qname/qtype against one snapshot.
 
-    Returns (rcode, answers) where answers is a list of
-    (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME, ANY, ...
+    Returns (rcode, answers, negative) where answers is a list of
+    (name, rtype, value, ttl), and negative says whether this is a negative
+    response (NXDOMAIN or NODATA) that must carry the apex SOA in Authority.
+    qtype is a mnemonic: A, CNAME, ANY, SOA, ...
+
+    Existence is decided on the snapshot's precomputed name set, which
+    includes empty non-terminals, so a name below a published record exists
+    (NOERROR/NODATA) even when it has no records of its own.
     """
     qname = qname.lower()
     if qname != ZONE and not qname.endswith("." + ZONE):
-        return "REFUSED", []
+        return "REFUSED", [], False
+
+    if qname == ZONE and qtype in ("SOA", "ANY"):
+        return "NOERROR", [(ZONE, "SOA", snapshot.soa(), NEGATIVE_TTL)], False
 
     answers = []
     node = qname
@@ -248,22 +294,30 @@ def resolve(snapshot, qname, qtype):
         rec = snapshot.records.get(node)
         if rec is None:
             if answers:
-                # A validated version never dangles; degrade gracefully.
-                return "NOERROR", answers
-            if node == ZONE:
-                return "NOERROR", []  # zone apex exists but holds no such data
-            return "NXDOMAIN", []
+                # A CNAME chain can end before the queried type: the alias
+                # records are the answer and the qname itself exists, so this
+                # is not NXDOMAIN.
+                return "NOERROR", answers, False
+            if node in snapshot.names:
+                # name exists (record-less or empty non-terminal) but holds no
+                # data of the queried type -> NODATA, not NXDOMAIN
+                return "NOERROR", [], True
+            return "NXDOMAIN", [], True  # neither the name nor any descendant
         if rec["CNAME"]:
             if node in seen:  # corrupt data safeguard; validated zones never loop
-                return "NOERROR", answers
+                return "NOERROR", answers, False
             seen.add(node)
             answers.append((node, "CNAME", rec["CNAME"], rec["ttl"]))
             if qtype == "CNAME":
-                return "NOERROR", answers
+                return "NOERROR", answers, False
             node = rec["CNAME"]
             continue
         if rec["A"]:
             if qtype in ("A", "ANY"):
                 answers.extend((node, "A", ip, rec["ttl"]) for ip in rec["A"])
-            return "NOERROR", answers
-        return "NOERROR", answers  # pragma: no cover
+                return "NOERROR", answers, False
+            # name exists, no data of that type: keep any CNAME chain that led
+            # here and mark it as a negative (NODATA) response for the SOA
+            return "NOERROR", answers, True
+        return "NOERROR", [], True  # pragma: no cover
+

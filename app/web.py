@@ -13,6 +13,8 @@ from .zone import Snapshot, ZoneError, flatten_records, fqdn, parse_zone_text
 
 app = FastAPI(title="svc.test. zone publisher", docs_url=None, redoc_url=None)
 
+QUERY_TYPES = ("A", "AAAA", "SOA")
+
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
 <style>
@@ -99,7 +101,7 @@ def index_body(msg="", err=""):
 <form method="get" action="/query">
   <input type="text" name="name" placeholder="web 或 web.svc.test." required>
   <select name="qtype">
-    <option>A</option><option>CNAME</option><option>ANY</option>
+    <option>A</option><option>AAAA</option><option>SOA</option>
   </select>
   <button type="submit">查询</button>
 </form>
@@ -153,9 +155,9 @@ def publish(zone_text: str = Form(...), note: str = Form("")):
 @app.get("/query", response_class=HTMLResponse)
 def query(name: str = "", qtype: str = "A"):
     qtype = qtype.upper()
-    if qtype not in ("A", "CNAME", "ANY"):
-        return page("<div class='err'>仅支持 A / CNAME / ANY 查询</div><p><a href='/'>返回</a></p>",
-                    status_code=400)
+    if qtype not in QUERY_TYPES:
+        return page(f"<div class='err'>仅支持 {' / '.join(QUERY_TYPES)} 查询</div>"
+                    "<p><a href='/'>返回</a></p>", status_code=400)
     try:
         qname = fqdn(name)
     except ValueError:
@@ -171,10 +173,17 @@ def query(name: str = "", qtype: str = "A"):
 
     rcode = dnslib.RCODE[resp.header.rcode]
     lines = [f";; ->>HEADER<<- rcode: {rcode}, aa: {resp.header.aa}"]
-    for rr in resp.rr:
-        lines.append(f"{rr.rname} {rr.ttl} IN {dnslib.QTYPE[rr.rtype]} {rr.rdata}")
-    if not resp.rr:
-        lines.append(";; (no answer records)")
+
+    def section(title, rrs):
+        out = [f";; {title} SECTION:"]
+        for rr in rrs:
+            out.append(f"{rr.rname} {rr.ttl} IN {dnslib.QTYPE[rr.rtype]} {rr.rdata}")
+        if not rrs:
+            out.append(";; (empty)")
+        return out
+
+    lines += section("ANSWER", resp.rr)
+    lines += section("AUTHORITY", resp.auth)
     body = (f"<h2>查询 {esc(qname)} {qtype}</h2><pre>{esc(chr(10).join(lines))}</pre>"
             "<p><a href='/'>返回</a></p>")
     return page(body, title=f"query {qname}")

@@ -29,6 +29,7 @@ web A 10.0.0.10 60
 web A 10.0.0.11 60        # 同名多 A 轮询
 api CNAME web             # 别名只能指向本区域已定义的名称
 app CNAME api             # 允许多级链，必须终结于 A 记录
+api.dev.svc.test. A 10.0.0.20 60   # 多标签名称写 FQDN；dev.svc.test. 因后代存在而存在
 ```
 
 每次提交即一个**完整新版本**（不是增量）。规则：
@@ -36,6 +37,20 @@ app CNAME api             # 允许多级链，必须终结于 A 记录
 - CNAME 目标必须是本版本内已定义的 `svc.test.` 区域内名称；悬空、循环（含自环）、指向区域外，整版拒绝；
 - 同一名称不能同时有 A 与 CNAME；A 值必须是合法 IPv4；
 - 校验或写入任一失败，整版不生效，当前版本继续服务。
+
+## 解析语义
+
+- **名称存在性**包含空非终端：发布 `api.dev.svc.test.` 后，`dev.svc.test.` 虽无自有记录也存在。
+  查询它以任何类型都返回 `NOERROR`（Answer 为空），而不是 `NXDOMAIN`，递归端不会把整个分支当成不存在。
+- **名称存在但缺少所问类型**（如对 A 名称查 AAAA/SOA，或查询空非终端）同样返回 `NOERROR` + 空 Answer。
+- **经 CNAME 查不到所问类型**时保留别名链：Answer 段带 CNAME 记录，仍为 `NOERROR`（NODATA）。
+- 只有**名称与其所有后代都不存在**时才返回 `NXDOMAIN`；区域外名称 `REFUSED`。
+- 两类否定应答（NXDOMAIN 与 NODATA）都在 **Authority 段**带区顶 SOA，TTL 与 SOA MINIMUM 均为
+  **60 秒**，供递归端做负缓存。
+- 直接查询 `svc.test. SOA` 返回该 SOA；序列号取当前**版本号的低 32 位**。
+- 名称存在性集合与 SOA 在 `Snapshot` 构建时一次算好，查询只做字典查找，不扫描整区、不读库；
+  发布切换或重启恢复后，二者都来自同一个已提交版本。
+
 
 ## 一致性与原子性设计
 
@@ -55,7 +70,7 @@ app CNAME api             # 允许多级链，必须终结于 A 记录
 | --- | --- |
 | `GET /` | 当前版本记录、发布表单（预填当前版）、查询表单、版本历史 |
 | `POST /publish` | 表单 `zone_text` + `note`；校验失败 400、写入失败 500、成功 303 |
-| `GET /query?name=&qtype=` | 网页发起真实 UDP 查询（A/CNAME/ANY） |
+| `GET /query?name=&qtype=` | 网页发起真实 UDP 查询（A/AAAA/SOA），显示 RCODE、Answer 与 Authority |
 | `GET /api/current` | 当前版本 JSON |
 | `GET /api/versions` | 版本历史 JSON |
 
@@ -76,6 +91,7 @@ app CNAME api             # 允许多级链，必须终结于 A 记录
 ```
 
 覆盖：事务原子性（唯一约束触发半途失败 → 无半版）、整版校验拒绝（悬空/循环/外部目标/
-类型冲突/非法地址/区域外名称）、链式解析与 NXDOMAIN/REFUSED/NODATA、发布期间并发查询的
-单版本一致性、写入失败（DB 路径被替换为目录 → 500、旧版照常应答、恢复后可继续发布）、
-重启后版本与记录完整恢复。
+类型冲突/非法地址/区域外名称）、链式解析与 NXDOMAIN/REFUSED/NODATA、空非终端与缺类型查询的
+NOERROR + Authority SOA（60 秒负缓存、序列号 = 版本号低 32 位）、直接 SOA 查询、发布期间并发
+查询的单版本一致性、写入失败（DB 路径被替换为目录 → 500、旧版照常应答、恢复后可继续发布）、
+重启后版本、记录与 SOA 完整恢复。
